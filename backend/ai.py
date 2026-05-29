@@ -17,26 +17,32 @@ client = OpenAI(
 )
 
 SYSTEM_PROMPT = """You are a helpful AI assistant integrated into a Kanban Project Management board (Kanban Studio).
-You can create, edit, rename, move, or delete columns and cards on the board by modifying the board data.
+You help the user by issuing a short list of ACTIONS that modify the board. You must NOT return the whole board — only the actions needed. This keeps responses fast.
 
-You must ALWAYS respond with a JSON object (and ONLY a JSON object) matching the following structure:
+Respond with ONLY a JSON object of exactly this shape:
 {{
-  "chatResponse": "Your text message back to the user explaining what you did.",
-  "boardUpdate": null or the complete updated BoardData object if you made changes (e.g. created, edited, moved, or deleted cards/columns).
+  "chatResponse": "A short message to the user describing what you did, or answering their question.",
+  "actions": [ ...zero or more action objects... ]
 }}
 
-Ensure that "boardUpdate" maintains the exact structural integrity of the Kanban board, including:
-- "columns": list of {{ "id": string, "title": string, "cardIds": list of strings }}
-- "cards": dictionary of card ID to {{ "id": string, "title": string, "details": string }}
+Supported action objects (reference columns and cards by their exact title or id as shown in the board below):
+- {{"type": "add_card", "column": "<column title or id>", "title": "<card title>", "details": "<card details>"}}
+- {{"type": "edit_card", "card": "<card title or id>", "title": "<new title, optional>", "details": "<new details, optional>"}}
+- {{"type": "delete_card", "card": "<card title or id>"}}
+- {{"type": "move_card", "card": "<card title or id>", "toColumn": "<column title or id>", "position": <optional 0-based index>}}
+- {{"type": "rename_column", "column": "<column title or id>", "title": "<new title>"}}
+- {{"type": "add_column", "title": "<column title>"}}
+- {{"type": "delete_column", "column": "<column title or id>"}}
 
-If the user wants you to create a card, generate a unique random ID (e.g. "card-xxxxxx" using random alphanumeric characters) and insert it both into the "cards" dictionary and the corresponding column's "cardIds" list.
-If the user wants you to move a card, find it in the "cardIds" of its current column and move it to the "cardIds" of the target column.
-If you do not need to make any changes to the board, set "boardUpdate" to null.
+Rules:
+- If the user only asks a question, or no change is needed, return "actions": [].
+- Do NOT invent card or column ids. Refer to existing items by the title or id shown below.
+- Keep "chatResponse" concise.
 
-Current Board Data:
+Current board:
 {board_json}
 
-DO NOT include any markdown formatting outside the JSON, other than optionally wrapping your JSON response in a single ```json ... ``` block. Do not write any conversational text before or after the JSON.
+Return only the JSON object, optionally wrapped in a single ```json ... ``` block. No other text.
 """
 
 def clean_json_response(raw_response: str) -> str:
@@ -83,18 +89,18 @@ def run_chat_query(messages: List[Dict[str, str]], current_board: Dict[str, Any]
         raw_text = completion.choices[0].message.content
         cleaned = clean_json_response(raw_text)
         parsed = json.loads(cleaned)
-        
-        # Simple structural validation
-        if "chatResponse" not in parsed:
-            parsed["chatResponse"] = "I have updated the board."
-        if "boardUpdate" not in parsed:
-            parsed["boardUpdate"] = None
-            
+
+        # Normalise the response shape
+        if not isinstance(parsed.get("chatResponse"), str):
+            parsed["chatResponse"] = "Done."
+        if not isinstance(parsed.get("actions"), list):
+            parsed["actions"] = []
+
         return parsed
     except Exception as e:
         return {
             "chatResponse": f"Sorry, I encountered an error processing your request: {str(e)}",
-            "boardUpdate": None
+            "actions": []
         }
 
 

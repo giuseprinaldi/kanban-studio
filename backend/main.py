@@ -1,5 +1,7 @@
 import os
+import uuid
 import logging
+from typing import Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, Response, HTTPException, status
 from fastapi.responses import FileResponse
@@ -229,34 +231,170 @@ async def update_kanban(board_data: BoardDataSchema, username: str = Depends(get
     save_user_board(db, user.id, board_data)
     return {"status": "success", "message": "Kanban board updated successfully"}
 
+# --- AI action application ---------------------------------------------------
+# The LLM returns a short list of actions rather than the whole board. We apply
+# them server-side to the authoritative board, which is far fewer output tokens
+# (so much faster) and can't silently drop unrelated cards/columns.
+
+def _new_id(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def _resolve_column(board: dict, ref) -> Optional[dict]:
+    """Find a column by id, then by case-insensitive title."""
+    if ref is None:
+        return None
+    ref_str = str(ref).strip()
+    for col in board["columns"]:
+        if col["id"] == ref_str:
+            return col
+    for col in board["columns"]:
+        if col["title"].strip().lower() == ref_str.lower():
+            return col
+    return None
+
+
+def _resolve_card_id(board: dict, ref) -> Optional[str]:
+    """Find a card id by id, then by case-insensitive title."""
+    if ref is None:
+        return None
+    ref_str = str(ref).strip()
+    if ref_str in board["cards"]:
+        return ref_str
+    for card_id, card in board["cards"].items():
+        if card["title"].strip().lower() == ref_str.lower():
+            return card_id
+    return None
+
+
+def _remove_card_from_columns(board: dict, card_id: str):
+    for col in board["columns"]:
+        if card_id in col["cardIds"]:
+            col["cardIds"].remove(card_id)
+
+
+def _insert_card(column: dict, card_id: str, position):
+    if isinstance(position, int) and 0 <= position <= len(column["cardIds"]):
+        column["cardIds"].insert(position, card_id)
+    else:
+        column["cardIds"].append(card_id)
+
+
+def apply_actions(board: dict, actions: list) -> list[str]:
+    """Apply a list of AI actions to `board` in place. Returns warnings for any
+    action that could not be applied (unknown type, unresolved target, etc.)."""
+    warnings: list[str] = []
+
+    for action in actions:
+        if not isinstance(action, dict):
+            warnings.append(f"ignored non-object action: {action!r}")
+            continue
+        atype = action.get("type")
+
+        if atype == "add_card":
+            col = _resolve_column(board, action.get("column"))
+            if not col:
+                warnings.append(f"add_card: column {action.get('column')!r} not found")
+                continue
+            card_id = _new_id("card")
+            board["cards"][card_id] = {
+                "id": card_id,
+                "title": action.get("title") or "Untitled",
+                "details": action.get("details") or "No details yet.",
+            }
+            _insert_card(col, card_id, action.get("position"))
+
+        elif atype == "edit_card":
+            card_id = _resolve_card_id(board, action.get("card"))
+            if not card_id:
+                warnings.append(f"edit_card: card {action.get('card')!r} not found")
+                continue
+            if action.get("title") is not None:
+                board["cards"][card_id]["title"] = action["title"]
+            if action.get("details") is not None:
+                board["cards"][card_id]["details"] = action["details"]
+
+        elif atype == "delete_card":
+            card_id = _resolve_card_id(board, action.get("card"))
+            if not card_id:
+                warnings.append(f"delete_card: card {action.get('card')!r} not found")
+                continue
+            board["cards"].pop(card_id, None)
+            _remove_card_from_columns(board, card_id)
+
+        elif atype == "move_card":
+            card_id = _resolve_card_id(board, action.get("card"))
+            target = _resolve_column(board, action.get("toColumn") or action.get("column"))
+            if not card_id or not target:
+                warnings.append(f"move_card: card {action.get('card')!r} or target column not found")
+                continue
+            _remove_card_from_columns(board, card_id)
+            _insert_card(target, card_id, action.get("position"))
+
+        elif atype == "rename_column":
+            col = _resolve_column(board, action.get("column"))
+            if not col:
+                warnings.append(f"rename_column: column {action.get('column')!r} not found")
+                continue
+            if action.get("title") is not None:
+                col["title"] = action["title"]
+
+        elif atype == "add_column":
+            new_id = _new_id("col")
+            board["columns"].append({
+                "id": new_id,
+                "title": action.get("title") or "New Column",
+                "cardIds": [],
+            })
+
+        elif atype == "delete_column":
+            col = _resolve_column(board, action.get("column"))
+            if not col:
+                warnings.append(f"delete_column: column {action.get('column')!r} not found")
+                continue
+            for card_id in list(col["cardIds"]):
+                board["cards"].pop(card_id, None)
+            board["columns"] = [c for c in board["columns"] if c["id"] != col["id"]]
+
+        else:
+            warnings.append(f"unknown action type: {atype!r}")
+
+    return warnings
+
+
 # AI Chat route
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(chat_request: ChatRequest, username: str = Depends(get_current_user), db: Session = Depends(get_db)):
     user = db.query(UserModel).filter(UserModel.username == username).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-        
+
     messages_list = [{"role": msg.role, "content": msg.content} for msg in chat_request.messages]
-    current_board_dict = chat_request.currentBoard.model_dump()
 
-    result = run_chat_query(messages_list, current_board_dict)
+    # Use the database board as the authoritative base for both the prompt and
+    # the action application, so the model and the server agree on state.
+    base_board = get_user_board(db, user.id).model_dump()
 
-    board_update = result.get("boardUpdate")
-    if board_update:
+    result = run_chat_query(messages_list, base_board)
+    chat_response = result.get("chatResponse") or "Done."
+    actions = result.get("actions") or []
+
+    board_update = None
+    if actions:
+        warnings = apply_actions(base_board, actions)
+        if warnings:
+            logger.info("AI action warnings (user_id=%s): %s", user.id, warnings)
         try:
-            validated_board = BoardDataSchema(**board_update)
-            # Guard against an LLM wiping the board: a board with no columns is
-            # almost certainly a bad response, not an intentional "delete everything".
+            validated_board = BoardDataSchema(**base_board)
             if not validated_board.columns:
-                raise ValueError("refusing to apply a board update with no columns")
+                raise ValueError("refusing to apply changes that leave no columns")
             save_user_board(db, user.id, validated_board)
-            result["boardUpdate"] = get_user_board(db, user.id)
+            board_update = get_user_board(db, user.id)
         except Exception as e:
             logger.warning("Discarding invalid AI board update (user_id=%s): %s", user.id, e)
-            result["boardUpdate"] = None
-            result["chatResponse"] += f" (Note: I tried to update the board, but the structure was invalid: {str(e)})"
+            chat_response += f" (Note: I tried to update the board, but the result was invalid: {str(e)})"
 
-    return result
+    return {"chatResponse": chat_response, "boardUpdate": board_update}
 
 # Health route
 @app.get("/api/health")

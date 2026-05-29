@@ -1,5 +1,3 @@
-import uuid
-
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -114,28 +112,24 @@ def test_kanban_retrieval_and_update():
     assert verify_response.json()["columns"][0]["title"] == "Test Backlog Rename"
 
 
-def test_chat_endpoint(monkeypatch):
-    # Generate a unique card ID for the mock run
-    generated_card_id = f"card-test-{uuid.uuid4().hex[:6]}"
+def _card_titles(board: dict) -> set:
+    return {card["title"] for card in board["cards"].values()}
 
+
+def test_chat_endpoint(monkeypatch):
+    # The model now returns a small action list; the server resolves the column
+    # by title and generates the card id itself.
     def mock_run_chat_query(messages, current_board):
-        updated_board = {
-            "columns": [dict(c) for c in current_board["columns"]],
-            "cards": dict(current_board["cards"]),
-        }
-        updated_board["cards"][generated_card_id] = {
-            "id": generated_card_id,
-            "title": "AI Card",
-            "details": "Created by AI",
-        }
-        updated_board["columns"][0] = dict(updated_board["columns"][0])
-        updated_board["columns"][0]["cardIds"] = [
-            *updated_board["columns"][0]["cardIds"],
-            generated_card_id,
-        ]
         return {
             "chatResponse": "I created a card for you.",
-            "boardUpdate": updated_board,
+            "actions": [
+                {
+                    "type": "add_card",
+                    "column": "Backlog",
+                    "title": "AI Card",
+                    "details": "Created by AI",
+                }
+            ],
         }
 
     # main.py imports run_chat_query at module level, so patch it there.
@@ -162,10 +156,17 @@ def test_chat_endpoint(monkeypatch):
     assert chat_response.status_code == 200
     res_data = chat_response.json()
     assert res_data["chatResponse"] == "I created a card for you."
-    assert "boardUpdate" in res_data
-    assert generated_card_id in res_data["boardUpdate"]["cards"]
+    assert res_data["boardUpdate"] is not None
+    assert "AI Card" in _card_titles(res_data["boardUpdate"])
+
+    # The new card should have been added to the Backlog column
+    backlog = next(c for c in res_data["boardUpdate"]["columns"] if c["title"] == "Backlog")
+    added_id = next(
+        cid for cid, card in res_data["boardUpdate"]["cards"].items() if card["title"] == "AI Card"
+    )
+    assert added_id in backlog["cardIds"]
 
     # Verify the card was transactionally saved to the database
     board_response2 = client.get("/api/kanban")
     assert board_response2.status_code == 200
-    assert generated_card_id in board_response2.json()["cards"]
+    assert "AI Card" in _card_titles(board_response2.json())
