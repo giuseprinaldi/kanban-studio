@@ -1,0 +1,14 @@
+node_modules
+frontend/node_modules
+frontend/out
+frontend/.next
+.git
+.gitignore
+__pycache__
+*.pyc
+*.db
+*.sqlite
+backend/pm.db
+*.log
+venv
+.venv
